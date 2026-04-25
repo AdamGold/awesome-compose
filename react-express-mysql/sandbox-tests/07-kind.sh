@@ -36,7 +36,19 @@ kind create cluster --name $NAME --config "$WORK/cluster.yaml" --wait 180s
 
 # `kind create cluster --wait` only waits for the control-plane to be Ready;
 # workers may still be registering. Explicitly wait for all of them.
-kubectl wait --for=condition=Ready nodes --all --timeout=180s
+if ! kubectl wait --for=condition=Ready nodes --all --timeout=180s; then
+  echo "FAIL: not all nodes became Ready"
+  echo "--- nodes ---"
+  kubectl get nodes -o wide || true
+  echo "--- node conditions (look for NetworkUnavailable on the stuck node) ---"
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}={.status} ({.reason}: {.message}){"\n"}{end}{"\n"}{end}' || true
+  echo "--- kube-system pods (kindnet/kube-proxy crashloops show here) ---"
+  kubectl -n kube-system get pods -o wide || true
+  echo "--- kindnet logs from the stuck node ---"
+  STUCK=$(kubectl get nodes -o jsonpath='{range .items[?(@.status.conditions[-1].status!="True")]}{.metadata.name}{"\n"}{end}' | head -1)
+  [ -n "$STUCK" ] && kubectl -n kube-system logs -l app=kindnet --tail=40 --field-selector=spec.nodeName=$STUCK || true
+  exit 1
+fi
 
 nodes=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
 [ "$nodes" -eq 3 ] || { echo "FAIL: expected 3 nodes, got $nodes"; kubectl get nodes; exit 1; }
