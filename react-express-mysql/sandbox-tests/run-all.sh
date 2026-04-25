@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 RESULTS=()
 
-for s in 01-tilt.sh 02-devcontainers.sh 03-dind.sh 04-postgres.sh 05-elasticsearch.sh 06-playwright.sh; do
+for s in 01-tilt.sh 02-devcontainers.sh 03-dind.sh 04-postgres.sh 05-elasticsearch.sh 06-playwright.sh 07-kind.sh; do
   echo
   echo "=================================================="
   echo ">>> $s"

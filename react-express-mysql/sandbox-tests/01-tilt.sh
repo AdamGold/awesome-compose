@@ -31,7 +31,7 @@ kind create cluster --name $NAME --wait 90s
 cat > Tiltfile <<'EOF'
 docker_build('sandbox/hello', '.', dockerfile_contents='''
 FROM nginx:alpine
-RUN echo "hello from tilt" > /usr/share/nginx/html/index.html
+RUN echo "hello-from-tilt" > /usr/share/nginx/html/index.html
 ''')
 k8s_yaml(blob('''
 apiVersion: apps/v1
@@ -48,12 +48,50 @@ spec:
       - name: hello
         image: sandbox/hello
         ports: [ { containerPort: 80 } ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  selector: { app: hello }
+  ports: [ { port: 80, targetPort: 80 } ]
 '''))
 k8s_resource('hello')
 EOF
 
 tilt ci --timeout 5m
 kubectl rollout status deploy/hello --timeout=120s
-kubectl get pod -l app=hello -o jsonpath='{.items[0].status.phase}' | grep -q Running
 
-echo "PASS: tilt"
+# Verify the service actually serves content Tilt built into the image,
+# not just that pods reached Running. In-cluster Job curls the Service by
+# DNS name and greps for the marker baked into the Dockerfile above.
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: tilt-curl-test }
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: curl
+        image: curlimages/curl:8.7.1
+        command: ["sh", "-c"]
+        args:
+          - |
+            for i in $(seq 1 10); do
+              curl -sf http://hello/ | grep -q "hello-from-tilt" && exit 0
+              sleep 2
+            done
+            exit 1
+EOF
+
+if ! kubectl wait --for=condition=complete job/tilt-curl-test --timeout=120s; then
+  echo "FAIL: tilt service unreachable or returned wrong content"
+  kubectl logs job/tilt-curl-test --tail=50 || true
+  exit 1
+fi
+
+echo "PASS: tilt (service serves the content built by tilt)"
