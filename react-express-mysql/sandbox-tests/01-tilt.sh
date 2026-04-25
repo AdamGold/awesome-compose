@@ -63,6 +63,12 @@ EOF
 tilt ci --timeout 5m
 kubectl rollout status deploy/hello --timeout=120s
 
+# Preload the curl image into the kind node. kind's containerd has its own
+# image cache separate from the host docker; pulling from Docker Hub from
+# inside a kind node may be slow or restricted even when the host can pull.
+docker pull curlimages/curl:8.7.1
+kind load docker-image curlimages/curl:8.7.1 --name $NAME
+
 # Verify the service actually serves content Tilt built into the image,
 # not just that pods reached Running. In-cluster Job curls the Service by
 # DNS name and greps for the marker baked into the Dockerfile above.
@@ -78,6 +84,7 @@ spec:
       containers:
       - name: curl
         image: curlimages/curl:8.7.1
+        imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:
           - |
@@ -90,6 +97,10 @@ EOF
 
 if ! kubectl wait --for=condition=complete job/tilt-curl-test --timeout=120s; then
   echo "FAIL: tilt service unreachable or returned wrong content"
+  echo "--- pod state ---"
+  kubectl get pods -l job-name=tilt-curl-test -o wide || true
+  kubectl describe pod -l job-name=tilt-curl-test | tail -40 || true
+  echo "--- pod logs ---"
   kubectl logs job/tilt-curl-test --tail=50 || true
   exit 1
 fi

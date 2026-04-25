@@ -75,6 +75,11 @@ EOF
 
 kubectl rollout status deploy/web --timeout=180s
 
+# Preload curl image into all kind nodes (containerd cache is per-node and
+# independent of the host docker registry path).
+docker pull curlimages/curl:8.7.1
+kind load docker-image curlimages/curl:8.7.1 --name $NAME
+
 # Pod-to-pod via cluster DNS
 kubectl apply -f - <<'EOF'
 apiVersion: batch/v1
@@ -88,6 +93,7 @@ spec:
       containers:
       - name: curl
         image: curlimages/curl:8.7.1
+        imagePullPolicy: IfNotPresent
         command: ["sh", "-c"]
         args:
           - |
@@ -100,7 +106,10 @@ EOF
 
 if ! kubectl wait --for=condition=complete job/curl-test --timeout=180s; then
   echo "FAIL: curl-test job did not complete"
-  kubectl describe job/curl-test
+  echo "--- pod state ---"
+  kubectl get pods -l job-name=curl-test -o wide || true
+  kubectl describe pod -l job-name=curl-test | tail -40 || true
+  echo "--- pod logs ---"
   kubectl logs job/curl-test --tail=50 || true
   exit 1
 fi
