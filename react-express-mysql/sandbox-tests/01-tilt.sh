@@ -100,6 +100,14 @@ if ! kubectl wait --for=condition=complete job/tilt-curl-test --timeout=120s; th
   echo "--- pod state ---"
   kubectl get pods -l job-name=tilt-curl-test -o wide || true
   kubectl describe pod -l job-name=tilt-curl-test | tail -40 || true
+  echo "--- service + endpoints (no endpoints => selector mismatch; endpoints but no traffic => kube-proxy/CNI) ---"
+  kubectl get svc,endpoints hello -o wide || true
+  echo "--- kube-proxy (look for iptables errors / module not found) ---"
+  kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=40 --all-containers || true
+  echo "--- coredns (look for resolver init errors) ---"
+  kubectl -n kube-system logs -l k8s-app=kube-dns --tail=20 --all-containers || true
+  echo "--- iptables NAT rules on the kind node (KUBE-SERVICES should list 'hello') ---"
+  docker exec ${NAME}-control-plane iptables -t nat -L KUBE-SERVICES 2>&1 | head -40 || true
   echo "--- pod logs ---"
   kubectl logs job/tilt-curl-test --tail=50 || true
   exit 1

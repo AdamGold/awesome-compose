@@ -109,6 +109,14 @@ if ! kubectl wait --for=condition=complete job/curl-test --timeout=180s; then
   echo "--- pod state ---"
   kubectl get pods -l job-name=curl-test -o wide || true
   kubectl describe pod -l job-name=curl-test | tail -40 || true
+  echo "--- service + endpoints ---"
+  kubectl get svc,endpoints web -o wide || true
+  echo "--- kube-proxy (look for iptables errors / module not found) ---"
+  kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=40 --all-containers || true
+  echo "--- coredns ---"
+  kubectl -n kube-system logs -l k8s-app=kube-dns --tail=20 --all-containers || true
+  echo "--- iptables NAT rules on a kind node ---"
+  docker exec ${NAME}-control-plane iptables -t nat -L KUBE-SERVICES 2>&1 | head -40 || true
   echo "--- pod logs ---"
   kubectl logs job/curl-test --tail=50 || true
   exit 1
