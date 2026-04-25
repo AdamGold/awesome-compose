@@ -44,9 +44,18 @@ if ! kubectl wait --for=condition=Ready nodes --all --timeout=180s; then
   kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}={.status} ({.reason}: {.message}){"\n"}{end}{"\n"}{end}' || true
   echo "--- kube-system pods (kindnet/kube-proxy crashloops show here) ---"
   kubectl -n kube-system get pods -o wide || true
-  echo "--- kindnet logs from the stuck node ---"
-  STUCK=$(kubectl get nodes -o jsonpath='{range .items[?(@.status.conditions[-1].status!="True")]}{.metadata.name}{"\n"}{end}' | head -1)
-  [ -n "$STUCK" ] && kubectl -n kube-system logs -l app=kindnet --tail=40 --field-selector=spec.nodeName=$STUCK || true
+  echo "--- describe of any non-Running kube-system pods (CreateContainerError reason in Events) ---"
+  for pod in $(kubectl -n kube-system get pods --no-headers | awk '$3 != "Running" || $2 != "1/1" { print $1 }'); do
+    echo ">> $pod"
+    kubectl -n kube-system describe pod "$pod" | sed -n '/Events:/,$p' | head -20
+  done
+  echo "--- recent kube-system events ---"
+  kubectl -n kube-system get events --sort-by=.lastTimestamp | tail -30 || true
+  echo "--- kind node container resource state (host docker view) ---"
+  for n in $(docker ps --filter "name=${NAME}" --format '{{.Names}}'); do
+    echo ">> $n"
+    docker stats --no-stream "$n" 2>/dev/null || true
+  done
   exit 1
 fi
 
