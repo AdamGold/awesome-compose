@@ -34,13 +34,12 @@ EOF
 
 kind create cluster --name $NAME --config "$WORK/cluster.yaml" --wait 180s
 
-# Node count
+# `kind create cluster --wait` only waits for the control-plane to be Ready;
+# workers may still be registering. Explicitly wait for all of them.
+kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
 nodes=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
 [ "$nodes" -eq 3 ] || { echo "FAIL: expected 3 nodes, got $nodes"; kubectl get nodes; exit 1; }
-
-# All nodes Ready
-not_ready=$(kubectl get nodes --no-headers | awk '$2 != "Ready" { print $1 }')
-[ -z "$not_ready" ] || { echo "FAIL: nodes not Ready: $not_ready"; exit 1; }
 
 # Workload + service spread across both workers
 kubectl apply -f - <<'EOF'
