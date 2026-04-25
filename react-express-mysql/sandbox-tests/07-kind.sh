@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# kind sandbox test: creates a 3-node cluster (1 control-plane + 2 workers),
+# deploys nginx + a Service, runs a Job that curls the Service from another
+# pod, asserts the Job completes successfully.
+# Stresses: privileged kind-node containers, nested cgroups, CNI (kindnet),
+# kube-proxy iptables programming, CoreDNS resolution, pod-to-pod networking
+# across worker nodes.
+set -euo pipefail
+
+NAME=kind-sandbox-test
+SUDO=$([ "$(id -u)" -eq 0 ] && echo "" || echo "sudo")
+
+command -v docker >/dev/null || { echo "FAIL: docker not installed"; exit 1; }
+if ! command -v kind >/dev/null; then
+  curl -fsSL https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64 -o /tmp/kind
+  chmod +x /tmp/kind && $SUDO mv /tmp/kind /usr/local/bin/kind
+fi
+if ! command -v kubectl >/dev/null; then
+  curl -fsSL https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl -o /tmp/kubectl
+  chmod +x /tmp/kubectl && $SUDO mv /tmp/kubectl /usr/local/bin/kubectl
+fi
+
+WORK=$(mktemp -d)
+trap "kind delete cluster --name $NAME 2>/dev/null || true; rm -rf $WORK" EXIT
+
+cat > "$WORK/cluster.yaml" <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+EOF
+
+kind create cluster --name $NAME --config "$WORK/cluster.yaml" --wait 180s
+
+# `kind create cluster --wait` only waits for the control-plane to be Ready;
+# workers may still be registering. Explicitly wait for all of them.
+if ! kubectl wait --for=condition=Ready nodes --all --timeout=180s; then
+  echo "FAIL: not all nodes became Ready"
+  echo "--- nodes ---"
+  kubectl get nodes -o wide || true
+  echo "--- node conditions (look for NetworkUnavailable on the stuck node) ---"
+  kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}={.status} ({.reason}: {.message}){"\n"}{end}{"\n"}{end}' || true
+  echo "--- kube-system pods (kindnet/kube-proxy crashloops show here) ---"
+  kubectl -n kube-system get pods -o wide || true
+  echo "--- describe of any non-Running kube-system pods (CreateContainerError reason in Events) ---"
+  for pod in $(kubectl -n kube-system get pods --no-headers | awk '$3 != "Running" || $2 != "1/1" { print $1 }'); do
+    echo ">> $pod"
+    kubectl -n kube-system describe pod "$pod" | sed -n '/Events:/,$p' | head -20
+  done
+  echo "--- recent kube-system events ---"
+  kubectl -n kube-system get events --sort-by=.lastTimestamp | tail -30 || true
+  echo "--- kind node container resource state (host docker view) ---"
+  for n in $(docker ps --filter "name=${NAME}" --format '{{.Names}}'); do
+    echo ">> $n"
+    docker stats --no-stream "$n" 2>/dev/null || true
+  done
+  exit 1
+fi
+
+nodes=$(kubectl get nodes --no-headers | wc -l | tr -d ' ')
+[ "$nodes" -eq 3 ] || { echo "FAIL: expected 3 nodes, got $nodes"; kubectl get nodes; exit 1; }
+
+# Workload + service spread across both workers
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector: { matchLabels: { app: web } }
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports: [ { containerPort: 80 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web }
+spec:
+  selector: { app: web }
+  ports: [ { port: 80, targetPort: 80 } ]
+EOF
+
+kubectl rollout status deploy/web --timeout=180s
+
+# Preload curl image into all kind nodes (containerd cache is per-node and
+# independent of the host docker registry path).
+docker pull curlimages/curl:8.7.1
+kind load docker-image curlimages/curl:8.7.1 --name $NAME
+
+# Pod-to-pod via cluster DNS
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata: { name: curl-test }
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: curl
+        image: curlimages/curl:8.7.1
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            for i in $(seq 1 10); do
+              curl -sf http://web/ | grep -q "Welcome to nginx" && exit 0
+              sleep 3
+            done
+            exit 1
+EOF
+
+if ! kubectl wait --for=condition=complete job/curl-test --timeout=180s; then
+  echo "FAIL: curl-test job did not complete"
+  echo "--- pod state ---"
+  kubectl get pods -l job-name=curl-test -o wide || true
+  kubectl describe pod -l job-name=curl-test | tail -40 || true
+  echo "--- service + endpoints ---"
+  kubectl get svc,endpoints web -o wide || true
+  echo "--- kube-proxy (look for iptables errors / module not found) ---"
+  kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=40 --all-containers || true
+  echo "--- coredns ---"
+  kubectl -n kube-system logs -l k8s-app=kube-dns --tail=20 --all-containers || true
+  echo "--- iptables NAT rules on a kind node ---"
+  docker exec ${NAME}-control-plane iptables -t nat -L KUBE-SERVICES 2>&1 | head -40 || true
+  echo "--- pod logs ---"
+  kubectl logs job/curl-test --tail=50 || true
+  exit 1
+fi
+
+echo "PASS: kind (3 nodes Ready, pod-to-pod via Service DNS works)"
