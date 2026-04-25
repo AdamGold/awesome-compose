@@ -38,22 +38,29 @@ node_v=$(devcontainer exec --workspace-folder "$WORK" cat /tmp/node-version.txt)
 [ "$marker" = "postcreate-ok" ] || { echo "FAIL: postCreateCommand did not run"; exit 1; }
 [[ "$node_v" =~ ^v[0-9]+\. ]] || { echo "FAIL: node not runnable (got $node_v)"; exit 1; }
 
-# Start a tiny HTTP server inside the container, then curl it from inside.
-# The server is daemonized so it survives this exec; the curl runs in a
-# separate exec to prove cross-exec process persistence + loopback networking.
-devcontainer exec --workspace-folder "$WORK" sh -c '
-  nohup node -e "require(\"http\").createServer((_,s)=>s.end(\"devcontainer-served-ok\")).listen(8765)" \
-    </dev/null >/tmp/srv.log 2>&1 &
-  disown || true
-'
+# Start a tiny HTTP server inside the container, curl it, kill it — all in
+# one exec. Doing this across two execs is fragile: docker exec can reap
+# session children when the foreground command returns, killing the server
+# before the second exec runs. Single-exec sidesteps that.
+resp=$(devcontainer exec --workspace-folder "$WORK" sh -c '
+  node -e "require(\"http\").createServer((_,s)=>s.end(\"devcontainer-served-ok\")).listen(8765)" \
+    >/tmp/srv.log 2>&1 &
+  pid=$!
+  for i in 1 2 3 4 5 6 7 8; do
+    body=$(curl -sf --max-time 2 http://localhost:8765/ 2>/dev/null) && {
+      kill $pid 2>/dev/null
+      printf "%s" "$body"
+      exit 0
+    }
+    sleep 0.5
+  done
+  kill $pid 2>/dev/null
+  exit 1
+' || true)
 
-# Give it a moment to bind
-sleep 2
-
-resp=$(devcontainer exec --workspace-folder "$WORK" sh -c 'curl -sf --max-time 5 http://localhost:8765/' || true)
 if [ "$resp" != "devcontainer-served-ok" ]; then
   echo "FAIL: in-container HTTP server unreachable (got: '$resp')"
-  devcontainer exec --workspace-folder "$WORK" cat /tmp/srv.log || true
+  devcontainer exec --workspace-folder "$WORK" cat /tmp/srv.log 2>/dev/null || true
   exit 1
 fi
 
